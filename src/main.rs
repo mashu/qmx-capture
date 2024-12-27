@@ -59,42 +59,10 @@ impl ViewState {
     }
 }
 
-fn list_devices() -> Result<Vec<cpal::Device>> {
-    let host = cpal::default_host();
-    let devices = host.input_devices()?;
-    println!("Available input devices:");
-    println!("----------------------");
-    
-    let device_list: Vec<_> = devices.collect();
-    for (idx, device) in device_list.iter().enumerate() {
-        if let Ok(name) = device.name() {
-            println!("{}. {} ({} Hz)", idx, name, 
-                device.default_input_config()
-                    .map_or(String::from("unknown"), |c| c.sample_rate().0.to_string()));
-        }
-    }
-    Ok(device_list)
-}
-
-fn get_user_device_choice(max: usize) -> usize {
-    loop {
-        println!("\nSelect device number (0-{}): ", max - 1);
-        let mut input = String::new();
-        stdin().read_line(&mut input).unwrap();
-        if let Ok(num) = input.trim().parse() {
-            if num < max {
-                return num;
-            }
-        }
-        println!("Invalid selection, try again");
-    }
-}
-
 struct Renderer {
     stdout: Stdout,
     output_buffer: String,
     term_width: u16,
-    term_height: u16,
 }
 
 impl Renderer {
@@ -102,12 +70,11 @@ impl Renderer {
         let mut stdout = stdout();
         execute!(stdout, EnterAlternateScreen, Hide)?;
         enable_raw_mode()?;
-        let (term_width, term_height) = size()?;
+        let (term_width, _) = size()?;
         Ok(Self {
             stdout,
-            output_buffer: String::with_capacity((term_width * term_height * 3) as usize),
+            output_buffer: String::with_capacity((term_width as usize) * 3),
             term_width,
-            term_height,
         })
     }
 
@@ -171,8 +138,39 @@ impl Drop for Renderer {
     }
 }
 
+fn list_devices() -> Result<Vec<cpal::Device>> {
+    let host = cpal::default_host();
+    let devices = host.input_devices()?;
+    println!("Available input devices:\n----------------------");
+    
+    let device_list: Vec<_> = devices.collect();
+    for (idx, device) in device_list.iter().enumerate() {
+        if let Ok(name) = device.name() {
+            if let Ok(config) = device.default_input_config() {
+                println!("{}. {} ({} Hz)", idx, name, config.sample_rate().0);
+            } else {
+                println!("{}. {}", idx, name);
+            }
+        }
+    }
+    Ok(device_list)
+}
+
+fn get_user_device_choice(max: usize) -> usize {
+    loop {
+        println!("\nSelect device number (0-{}): ", max - 1);
+        let mut input = String::new();
+        stdin().read_line(&mut input).unwrap();
+        if let Ok(num) = input.trim().parse() {
+            if num < max {
+                return num;
+            }
+        }
+        println!("Invalid selection, try again");
+    }
+}
+
 fn main() -> Result<()> {
-    // Device selection
     let device_list = list_devices()?;
     if device_list.is_empty() {
         println!("No input devices found!");
