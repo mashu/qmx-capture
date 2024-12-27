@@ -6,4 +6,5 @@ edition = "2021"
 [dependencies]
 cpal = "0.15"
 anyhow = "1.0"
-libc = "0.2"
+rustfft = "6.1"
+crossterm = "0.27"
