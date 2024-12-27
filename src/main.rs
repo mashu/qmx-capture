@@ -20,6 +20,7 @@ use std::{
 
 const FFT_SIZE: usize = 2048;
 const TARGET_FPS: u64 = 30;
+const BASE_GAIN: f32 = 10.0;
 
 #[derive(Clone)]
 struct AudioBuffer {
@@ -108,7 +109,8 @@ impl Renderer {
                 let idx = ((j as f32 * freq_step) * FFT_SIZE as f32 / sample_rate as f32) as usize;
                 if idx < points.len() {
                     let magnitude = points[idx].1;
-                    let color = match (magnitude * 100.0) as u8 {
+                    let normalized = (magnitude * 200.0).min(100.0) as u8;
+                    let color = match normalized {
                         0..=20 => Color::Blue,
                         21..=40 => Color::Cyan,
                         41..=60 => Color::Green,
@@ -248,7 +250,7 @@ fn main() -> Result<()> {
                 .enumerate()
                 .map(|(i, &sample)| {
                     let window = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / FFT_SIZE as f32).cos());
-                    Complex::new(sample * window * state.gain, 0.0)
+                    Complex::new(sample * window * state.gain * BASE_GAIN, 0.0)
                 })
                 .collect();
             
@@ -259,7 +261,8 @@ fn main() -> Result<()> {
                 .enumerate()
                 .map(|(i, x)| {
                     if i == 0 { return 0.0; }
-                    (x.norm_sqr() as f32).sqrt()
+                    let freq_scale = (1.0 + (i as f32 / 100.0)).log10();
+                    (x.norm_sqr() as f32).sqrt() * freq_scale
                 })
                 .collect()
         };
