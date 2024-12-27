@@ -60,6 +60,10 @@ fn get_user_device_choice(max: usize) -> usize {
     }
 }
 
+fn magnitude_to_color(value: f32, min: f32, max: f32) -> u8 {
+    ((value - min) / (max - min) * 255.0) as u8
+}
+
 fn main() -> Result<()> {
     let device_list = list_devices()?;
     if device_list.is_empty() {
@@ -162,15 +166,14 @@ fn main() -> Result<()> {
             print!("{:3}ms │", (i as u64 * UPDATE_INTERVAL_MS));
             for &magnitude in waterfall[row].iter().step_by(8) {
                 let normalized = (magnitude * 50.0).min(1.0);
-                print!("{}", match (normalized * 8.0) as u8 {
-                    0 => " ",
-                    1 => "░",
-                    2 => "▒",
-                    3 => "▓",
-                    4 => "█",
-                    5 => "█",
-                    _ => "█",
-                });
+                let (r, g, b) = match (normalized * 100.0) as u8 {
+                    0..=20 => (0, 0, magnitude_to_color(normalized, 0.0, 0.2)),
+                    21..=40 => (0, magnitude_to_color(normalized, 0.2, 0.4), 255),
+                    41..=60 => (0, 255, 255 - magnitude_to_color(normalized, 0.4, 0.6)),
+                    61..=80 => (magnitude_to_color(normalized, 0.6, 0.8), 255, 0),
+                    _ => (255, 255 - magnitude_to_color(normalized, 0.8, 1.0), 0),
+                };
+                print!("\x1b[48;2;{};{};{}m \x1b[0m", r, g, b);
             }
             println!();
         }
