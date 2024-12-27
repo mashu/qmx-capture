@@ -1,26 +1,62 @@
 use anyhow::Result;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::*;
 use rustfft::{FftPlanner, num_complex::Complex};
+use textplots::{Chart, Plot, Shape};
 use crossterm::{
-    execute,
-    terminal::{Clear, ClearType},
-    cursor::MoveTo,
+    execute, queue,
+    terminal::{Clear, ClearType, size, enable_raw_mode, disable_raw_mode, 
+               EnterAlternateScreen, LeaveAlternateScreen},
+    cursor::{MoveTo, Hide, Show},
+    style::{Color, SetForegroundColor, SetBackgroundColor, ResetColor},
     event::{self, Event, KeyCode},
 };
 use std::{
     sync::{Arc, Mutex},
-    io::stdout,
-    time::Duration,
+    io::{stdout, Write, Stdout, stdin},
+    fmt::Write as _,
+    time::{Duration, Instant},
     thread,
 };
 
 const FFT_SIZE: usize = 2048;
-const WATERFALL_LINES: usize = 30;
-const UPDATE_INTERVAL_MS: u64 = 50;
+const TARGET_FPS: u64 = 30;
 
+#[derive(Clone)]
 struct AudioBuffer {
     samples: Vec<f32>,
     position: usize,
+}
+
+#[derive(Clone)]
+struct ViewState {
+    gain: f32,
+    freq_zoom: f32,
+    waterfall_data: Vec<Vec<(f32, f32)>>,
+    current_line: usize,
+    history_size: usize,
+}
+
+impl ViewState {
+    fn new(history_size: usize) -> Self {
+        Self {
+            gain: 5.0,
+            freq_zoom: 1.0,
+            waterfall_data: vec![vec![(0.0, 0.0); FFT_SIZE/2]; history_size],
+            current_line: 0,
+            history_size,
+        }
+    }
+
+    fn add_spectrum(&mut self, spectrum: Vec<f32>, sample_rate: u32) {
+        self.waterfall_data[self.current_line] = spectrum.iter()
+            .enumerate()
+            .map(|(i, &mag)| {
+                let freq = i as f32 * sample_rate as f32 / FFT_SIZE as f32;
+                (freq, mag)
+            })
+            .collect();
+        self.current_line = (self.current_line + 1) % self.history_size;
+    }
 }
 
 fn list_devices() -> Result<Vec<cpal::Device>> {
@@ -32,17 +68,11 @@ fn list_devices() -> Result<Vec<cpal::Device>> {
     let device_list: Vec<_> = devices.collect();
     for (idx, device) in device_list.iter().enumerate() {
         if let Ok(name) = device.name() {
-            print!("{}. {}", idx, name);
-            if let Ok(config) = device.default_input_config() {
-                println!(" ({} ch, {} Hz)", 
-                    config.channels(),
-                    config.sample_rate().0);
-            } else {
-                println!();
-            }
+            println!("{}. {} ({} Hz)", idx, name, 
+                device.default_input_config()
+                    .map_or(String::from("unknown"), |c| c.sample_rate().0.to_string()));
         }
     }
-    
     Ok(device_list)
 }
 
@@ -50,7 +80,7 @@ fn get_user_device_choice(max: usize) -> usize {
     loop {
         println!("\nSelect device number (0-{}): ", max - 1);
         let mut input = String::new();
-        std::io::stdin().read_line(&mut input).unwrap();
+        stdin().read_line(&mut input).unwrap();
         if let Ok(num) = input.trim().parse() {
             if num < max {
                 return num;
@@ -60,11 +90,89 @@ fn get_user_device_choice(max: usize) -> usize {
     }
 }
 
-fn magnitude_to_color(value: f32, min: f32, max: f32) -> u8 {
-    ((value - min) / (max - min) * 255.0) as u8
+struct Renderer {
+    stdout: Stdout,
+    output_buffer: String,
+    term_width: u16,
+    term_height: u16,
+}
+
+impl Renderer {
+    fn new() -> Result<Self> {
+        let mut stdout = stdout();
+        execute!(stdout, EnterAlternateScreen, Hide)?;
+        enable_raw_mode()?;
+        let (term_width, term_height) = size()?;
+        Ok(Self {
+            stdout,
+            output_buffer: String::with_capacity((term_width * term_height * 3) as usize),
+            term_width,
+            term_height,
+        })
+    }
+
+    fn render(&mut self, state: &ViewState, sample_rate: u32) -> Result<()> {
+        self.output_buffer.clear();
+        write!(self.output_buffer, "Gain: {:.1}x | Freq Zoom: {:.1}x | Press 'q' to quit | FPS: {}\n\n", 
+               state.gain, state.freq_zoom, TARGET_FPS)?;
+
+        let max_freq = sample_rate as f32 / state.freq_zoom / 2.0;
+        write!(self.output_buffer, "Spectrum Analysis (0 Hz - {:.0} Hz)\n", max_freq)?;
+        write!(self.output_buffer, "────────────────────────────────\n")?;
+
+        let spectrum_chart = Chart::new(self.term_width as u32, 5, 0.0, max_freq)
+            .lineplot(&Shape::Lines(&state.waterfall_data[state.current_line]))
+            .to_string();
+        write!(self.output_buffer, "{}", spectrum_chart)?;
+
+        queue!(self.stdout, 
+            Clear(ClearType::All),
+            MoveTo(0, 0)
+        )?;
+        write!(self.stdout, "{}", self.output_buffer)?;
+
+        for i in 0..state.history_size {
+            let line = (state.current_line + i) % state.history_size;
+            let points = &state.waterfall_data[line];
+            queue!(self.stdout, MoveTo(0, i as u16 + 15))?;
+
+            let freq_step = (sample_rate as f32) / 2.0 / state.freq_zoom / (self.term_width as f32);
+            for j in 0..self.term_width as usize {
+                let idx = ((j as f32 * freq_step) * FFT_SIZE as f32 / sample_rate as f32) as usize;
+                if idx < points.len() {
+                    let magnitude = points[idx].1;
+                    let color = match (magnitude * 100.0) as u8 {
+                        0..=20 => Color::Blue,
+                        21..=40 => Color::Cyan,
+                        41..=60 => Color::Green,
+                        61..=80 => Color::Yellow,
+                        _ => Color::Red,
+                    };
+                    queue!(
+                        self.stdout,
+                        SetBackgroundColor(color),
+                        SetForegroundColor(color),
+                    )?;
+                    write!(self.stdout, "█")?;
+                    queue!(self.stdout, ResetColor)?;
+                }
+            }
+            writeln!(self.stdout)?;
+        }
+        self.stdout.flush()?;
+        Ok(())
+    }
+}
+
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        let _ = execute!(self.stdout, Show, LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+    }
 }
 
 fn main() -> Result<()> {
+    // Device selection
     let device_list = list_devices()?;
     if device_list.is_empty() {
         println!("No input devices found!");
@@ -76,11 +184,18 @@ fn main() -> Result<()> {
     
     let config = device.default_input_config()?;
     let sample_rate = config.sample_rate().0;
-    println!("\nUsing device: {} @ {} Hz", device.name()?, sample_rate);
+    println!("\nSelected device: {} @ {} Hz", device.name()?, sample_rate);
+    println!("Press Enter to start visualization...");
+    let mut input = String::new();
+    stdin().read_line(&mut input)?;
     
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(FFT_SIZE);
     
+    let (_, term_height) = size()?;
+    let history_size = (term_height - 15) as usize;
+    
+    let mut state = ViewState::new(history_size);
     let buffer = Arc::new(Mutex::new(AudioBuffer {
         samples: vec![0.0; FFT_SIZE],
         position: 0,
@@ -102,90 +217,62 @@ fn main() -> Result<()> {
     )?;
     
     stream.play()?;
-    
-    let mut waterfall = vec![vec![0.0f32; FFT_SIZE/2]; WATERFALL_LINES];
-    let mut line = 0;
-    
-    println!("\nPress 'q' to exit");
-    
+    let mut renderer = Renderer::new()?;
+
+    let frame_time = Duration::from_micros(1_000_000 / TARGET_FPS);
     loop {
-        if event::poll(Duration::from_millis(1))? {
+        let frame_start = Instant::now();
+
+        if event::poll(Duration::from_millis(0))? {
             if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('q') {
-                    break;
+                match key.code {
+                    KeyCode::Char('q') => break,
+                    KeyCode::Char('+') => state.gain *= 1.2,
+                    KeyCode::Char('-') => state.gain /= 1.2,
+                    KeyCode::Char('w') => state.freq_zoom *= 1.2,
+                    KeyCode::Char('s') => state.freq_zoom /= 1.2,
+                    _ => (),
                 }
             }
         }
-        
-        let samples = {
+
+        let spectrum = {
             let buffer = buffer.lock().unwrap();
-            let mut samples = buffer.samples.clone();
+            let mut ordered_samples = vec![0.0; FFT_SIZE];
+            let pos = buffer.position;
+            
             for i in 0..FFT_SIZE {
-                let window = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / FFT_SIZE as f32).cos());
-                samples[i] *= window;
+                let sample_pos = (pos + FFT_SIZE - i) % FFT_SIZE;
+                ordered_samples[FFT_SIZE - 1 - i] = buffer.samples[sample_pos];
             }
-            samples
+            
+            let mut fft_buffer: Vec<Complex<f32>> = ordered_samples.iter()
+                .enumerate()
+                .map(|(i, &sample)| {
+                    let window = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / FFT_SIZE as f32).cos());
+                    Complex::new(sample * window * state.gain, 0.0)
+                })
+                .collect();
+            
+            fft.process(&mut fft_buffer);
+            
+            fft_buffer.iter()
+                .take(FFT_SIZE/2)
+                .enumerate()
+                .map(|(i, x)| {
+                    if i == 0 { return 0.0; }
+                    (x.norm_sqr() as f32).sqrt()
+                })
+                .collect()
         };
         
-        let mut fft_buffer: Vec<Complex<f32>> = samples.iter()
-            .map(|&x| Complex::new(x, 0.0))
-            .collect();
-        
-        fft.process(&mut fft_buffer);
-        
-        let spectrum: Vec<f32> = fft_buffer.iter()
-            .take(FFT_SIZE/2)
-            .map(|x| (x.norm_sqr() as f32).sqrt())
-            .collect();
-        
-        waterfall[line] = spectrum;
-        line = (line + 1) % WATERFALL_LINES;
-        
-        execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
-        
-        // Draw frequency scale
-        print!("Time │");
-        let freq_step = sample_rate as usize / (FFT_SIZE * 2);
-        for f in (0..FFT_SIZE/2).step_by(8) {
-            if f % 64 == 0 {
-                print!("{:4}Hz ", f * freq_step);
-            }
+        state.add_spectrum(spectrum, sample_rate);
+        renderer.render(&state, sample_rate)?;
+
+        let elapsed = frame_start.elapsed();
+        if elapsed < frame_time {
+            thread::sleep(frame_time - elapsed);
         }
-        println!();
-        
-        // Draw top border
-        print!("─────┬");
-        for _ in 0..(FFT_SIZE/16) {
-            print!("────");
-        }
-        println!();
-        
-        // Draw waterfall with time scale
-        for i in 0..WATERFALL_LINES {
-            let row = (line + i) % WATERFALL_LINES;
-            print!("{:3}ms │", (i as u64 * UPDATE_INTERVAL_MS));
-            for &magnitude in waterfall[row].iter().step_by(8) {
-                let normalized = (magnitude * 50.0).min(1.0);
-                let (r, g, b) = match (normalized * 100.0) as u8 {
-                    0..=20 => (0, 0, magnitude_to_color(normalized, 0.0, 0.2)),
-                    21..=40 => (0, magnitude_to_color(normalized, 0.2, 0.4), 255),
-                    41..=60 => (0, 255, 255 - magnitude_to_color(normalized, 0.4, 0.6)),
-                    61..=80 => (magnitude_to_color(normalized, 0.6, 0.8), 255, 0),
-                    _ => (255, 255 - magnitude_to_color(normalized, 0.8, 1.0), 0),
-                };
-                print!("\x1b[48;2;{};{};{}m \x1b[0m", r, g, b);
-            }
-            println!();
-        }
-        
-        // Draw bottom border
-        print!("─────┴");
-        for _ in 0..(FFT_SIZE/16) {
-            print!("────");
-        }
-        println!("\nFrequency spectrum │ █ High ▓ ▒ ░ Low");
-        
-        thread::sleep(Duration::from_millis(UPDATE_INTERVAL_MS));
     }
     
     Ok(())
