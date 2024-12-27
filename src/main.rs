@@ -272,11 +272,18 @@ fn main() -> Result<()> {
     }
 
     let device_idx = get_user_device_choice(device_list.len());
-    let device = &device_list[device_idx];
+    let input_device = &device_list[device_idx];
 
-    let config = device.default_input_config()?;
-    let sample_rate = config.sample_rate().0;
-    println!("\nSelected device: {} @ {} Hz", device.name()?, sample_rate);
+    let input_config = input_device.default_input_config()?;
+    let sample_rate = input_config.sample_rate().0;
+    println!("\nSelected device: {} @ {} Hz", input_device.name()?, sample_rate);
+    
+    // Select output device
+    let host = cpal::default_host();
+    let output_device = host.default_output_device()
+        .expect("No output device available");
+    let output_config = output_device.default_output_config()?;
+    
     println!("Press Enter to start visualization...");
     let mut input = String::new();
     stdin().read_line(&mut input)?;
@@ -288,27 +295,51 @@ fn main() -> Result<()> {
     let history_size = (term_height - 15) as usize;
 
     let mut state = ViewState::new(history_size);
-    let buffer = Arc::new(Mutex::new(AudioBuffer {
+    
+    // Create shared buffers for input and output
+    let input_buffer = Arc::new(Mutex::new(AudioBuffer {
         samples: vec![0.0; FFT_SIZE],
         position: 0,
     }));
+    let output_buffer = Arc::clone(&input_buffer);
 
-    let buffer_clone = Arc::clone(&buffer);
-    let stream = device.build_input_stream(
-        &config.into(),
+    // Input stream configuration
+    let input_buffer_clone = Arc::clone(&input_buffer);
+    let input_stream = input_device.build_input_stream(
+        &input_config.into(),
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            let mut buffer = buffer_clone.lock().unwrap();
+            let mut buffer = input_buffer_clone.lock().unwrap();
             for &sample in data {
                 let pos = buffer.position;
                 buffer.samples[pos] = sample;
                 buffer.position = (buffer.position + 1) % FFT_SIZE;
             }
         },
-        |err| eprintln!("Error in stream: {}", err),
+        |err| eprintln!("Error in input stream: {}", err),
         None,
     )?;
 
-    stream.play()?;
+    // Output stream configuration
+    let output_stream = output_device.build_output_stream(
+        &output_config.config(),
+        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            let mut buffer = output_buffer.lock().unwrap();
+            
+            // Copy samples to output buffer
+            for sample in data.iter_mut() {
+                let pos = buffer.position;
+                *sample = buffer.samples[pos];
+                buffer.position = (buffer.position + 1) % FFT_SIZE;
+            }
+        },
+        |err| eprintln!("Error in output stream: {}", err),
+        None,
+    )?;
+
+    // Start both streams
+    input_stream.play()?;
+    output_stream.play()?;
+
     let mut renderer = Renderer::new()?;
 
     let frame_time = Duration::from_micros(1_000_000 / TARGET_FPS);
@@ -329,7 +360,7 @@ fn main() -> Result<()> {
         }
 
         let spectrum = {
-            let buffer = buffer.lock().unwrap();
+            let buffer = input_buffer.lock().unwrap();
             let mut ordered_samples = vec![0.0; FFT_SIZE];
             let pos = buffer.position;
 
