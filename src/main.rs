@@ -1,3 +1,9 @@
+//! QMX capture is a terminal based pan-adapter.
+//!
+//! # Examples
+//! ```
+//! cargo run
+//! ```
 use anyhow::Result;
 use cpal::traits::*;
 use rustfft::{FftPlanner, num_complex::Complex};
