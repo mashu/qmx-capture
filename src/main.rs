@@ -71,7 +71,8 @@ fn main() -> Result<()> {
     let device = &device_list[device_idx];
     
     let config = device.default_input_config()?;
-    println!("\nUsing device: {} @ {} Hz", device.name()?, config.sample_rate().0);
+    let sample_rate = config.sample_rate().0;
+    println!("\nUsing device: {} @ {} Hz", device.name()?, sample_rate);
     
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(FFT_SIZE);
@@ -138,21 +139,48 @@ fn main() -> Result<()> {
         
         execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
         
+        // Draw frequency scale
+        print!("Time │");
+        let freq_step = sample_rate as usize / (FFT_SIZE * 2);
+        for f in (0..FFT_SIZE/2).step_by(8) {
+            if f % 64 == 0 {
+                print!("{:4}Hz ", f * freq_step);
+            }
+        }
+        println!();
+        
+        // Draw top border
+        print!("─────┬");
+        for _ in 0..(FFT_SIZE/16) {
+            print!("────");
+        }
+        println!();
+        
+        // Draw waterfall with time scale
         for i in 0..WATERFALL_LINES {
             let row = (line + i) % WATERFALL_LINES;
+            print!("{:3}ms │", (i as u64 * UPDATE_INTERVAL_MS));
             for &magnitude in waterfall[row].iter().step_by(8) {
                 let normalized = (magnitude * 50.0).min(1.0);
-                let intensity = (normalized * 9.0) as u8;
-                print!("{}", match intensity {
+                print!("{}", match (normalized * 8.0) as u8 {
                     0 => " ",
-                    1..=3 => ".",
-                    4..=6 => "+",
-                    7..=8 => "#",
-                    _ => "@",
+                    1 => "░",
+                    2 => "▒",
+                    3 => "▓",
+                    4 => "█",
+                    5 => "█",
+                    _ => "█",
                 });
             }
             println!();
         }
+        
+        // Draw bottom border
+        print!("─────┴");
+        for _ in 0..(FFT_SIZE/16) {
+            print!("────");
+        }
+        println!("\nFrequency spectrum │ █ High ▓ ▒ ░ Low");
         
         thread::sleep(Duration::from_millis(UPDATE_INTERVAL_MS));
     }
