@@ -1,17 +1,10 @@
-//! QMX capture is a terminal based pan-adapter.
-//!
-//! # Examples
-//! ```
-//! cargo run
-//! ```
 use anyhow::Result;
 use cpal::traits::*;
 use rustfft::{FftPlanner, num_complex::Complex};
 use textplots::{Chart, Plot, Shape};
 use crossterm::{
     execute, queue,
-    terminal::{Clear, ClearType, size, enable_raw_mode, disable_raw_mode, 
-               EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{size, enable_raw_mode, disable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     cursor::{MoveTo, Hide, Show},
     style::{Color, SetForegroundColor, SetBackgroundColor, ResetColor},
     event::{self, Event, KeyCode},
@@ -19,7 +12,6 @@ use crossterm::{
 use std::{
     sync::{Arc, Mutex},
     io::{stdout, Write, Stdout, stdin},
-    fmt::Write as _,
     time::{Duration, Instant},
     thread,
 };
@@ -66,10 +58,51 @@ impl ViewState {
     }
 }
 
+#[derive(Clone, PartialEq)]
+struct ScreenCell {
+    char: char,
+    fg_color: Option<Color>,
+    bg_color: Option<Color>,
+}
+
+impl Default for ScreenCell {
+    fn default() -> Self {
+        Self {
+            char: ' ',
+            fg_color: None,
+            bg_color: None,
+        }
+    }
+}
+
+struct ScreenBuffer {
+    cells: Vec<Vec<ScreenCell>>,
+    width: usize,
+    height: usize,
+}
+
+impl ScreenBuffer {
+    fn new(width: usize, height: usize) -> Self {
+        Self {
+            cells: vec![vec![ScreenCell::default(); width]; height],
+            width,
+            height,
+        }
+    }
+
+    fn clear(&mut self) {
+        for row in &mut self.cells {
+            for cell in row {
+                *cell = ScreenCell::default();
+            }
+        }
+    }
+}
+
 struct Renderer {
     stdout: Stdout,
-    output_buffer: String,
-    term_width: u16,
+    front_buffer: ScreenBuffer,
+    back_buffer: ScreenBuffer,
 }
 
 impl Renderer {
@@ -77,41 +110,60 @@ impl Renderer {
         let mut stdout = stdout();
         execute!(stdout, EnterAlternateScreen, Hide)?;
         enable_raw_mode()?;
-        let (term_width, _) = size()?;
+        let (term_width, term_height) = size()?;
+
         Ok(Self {
             stdout,
-            output_buffer: String::with_capacity((term_width as usize) * 3),
-            term_width,
+            front_buffer: ScreenBuffer::new(term_width as usize, term_height as usize),
+            back_buffer: ScreenBuffer::new(term_width as usize, term_height as usize),
         })
     }
 
+    fn write_str_at(&mut self, x: usize, y: usize, s: &str) {
+        let cells = &mut self.back_buffer.cells[y];
+        for (i, c) in s.chars().enumerate() {
+            if x + i >= self.back_buffer.width {
+                break;
+            }
+            cells[x + i].char = c;
+        }
+    }
+
+    fn set_cell(&mut self, x: usize, y: usize, cell: ScreenCell) {
+        if x < self.back_buffer.width && y < self.back_buffer.height {
+            self.back_buffer.cells[y][x] = cell;
+        }
+    }
+
     fn render(&mut self, state: &ViewState, sample_rate: u32) -> Result<()> {
-        self.output_buffer.clear();
-        write!(self.output_buffer, "Gain: {:.1}x | Freq Zoom: {:.1}x | Press 'q' to quit | FPS: {}\n\n", 
-               state.gain, state.freq_zoom, TARGET_FPS)?;
+        self.back_buffer.clear();
+
+        // Render header
+        let header = format!("Gain: {:.1}x | Freq Zoom: {:.1}x | Press 'q' to quit | FPS: {}",
+                           state.gain, state.freq_zoom, TARGET_FPS);
+        self.write_str_at(0, 0, &header);
 
         let max_freq = sample_rate as f32 / state.freq_zoom / 2.0;
-        write!(self.output_buffer, "Spectrum Analysis (0 Hz - {:.0} Hz)\n", max_freq)?;
-        write!(self.output_buffer, "────────────────────────────────\n")?;
+        let spectrum_header = format!("Spectrum Analysis (0 Hz - {:.0} Hz)", max_freq);
+        self.write_str_at(0, 2, &spectrum_header);
 
-        let spectrum_chart = Chart::new(self.term_width as u32, 5, 0.0, max_freq)
+        self.write_str_at(0, 3, "────────────────────────────────");
+
+        // Render spectrum chart
+        let spectrum_chart = Chart::new(self.back_buffer.width as u32, 5, 0.0, max_freq)
             .lineplot(&Shape::Lines(&state.waterfall_data[state.current_line]))
             .to_string();
-        write!(self.output_buffer, "{}", spectrum_chart)?;
+        for (i, line) in spectrum_chart.lines().enumerate() {
+            self.write_str_at(0, 4 + i, line);
+        }
 
-        queue!(self.stdout, 
-            Clear(ClearType::All),
-            MoveTo(0, 0)
-        )?;
-        write!(self.stdout, "{}", self.output_buffer)?;
-
+        // Render waterfall
+        let freq_step = (sample_rate as f32) / 2.0 / state.freq_zoom / (self.back_buffer.width as f32);
         for i in 0..state.history_size {
             let line = (state.current_line + i) % state.history_size;
             let points = &state.waterfall_data[line];
-            queue!(self.stdout, MoveTo(0, i as u16 + 15))?;
 
-            let freq_step = (sample_rate as f32) / 2.0 / state.freq_zoom / (self.term_width as f32);
-            for j in 0..self.term_width as usize {
+            for j in 0..self.back_buffer.width {
                 let idx = ((j as f32 * freq_step) * FFT_SIZE as f32 / sample_rate as f32) as usize;
                 if idx < points.len() {
                     let magnitude = points[idx].1;
@@ -123,18 +175,52 @@ impl Renderer {
                         61..=80 => Color::Yellow,
                         _ => Color::Red,
                     };
-                    queue!(
-                        self.stdout,
-                        SetBackgroundColor(color),
-                        SetForegroundColor(color),
-                    )?;
-                    write!(self.stdout, "█")?;
-                    queue!(self.stdout, ResetColor)?;
+                    self.set_cell(j, i + 15, ScreenCell {
+                        char: '█',
+                        fg_color: Some(color),
+                        bg_color: Some(color),
+                    });
                 }
             }
-            writeln!(self.stdout)?;
         }
+
+        // Update screen with changes
+        let mut current_fg = None;
+        let mut current_bg = None;
+
+        for y in 0..self.back_buffer.height {
+            for x in 0..self.back_buffer.width {
+                let front_cell = &self.front_buffer.cells[y][x];
+                let back_cell = &self.back_buffer.cells[y][x];
+
+                if front_cell != back_cell {
+                    queue!(self.stdout, MoveTo(x as u16, y as u16))?;
+
+                    if current_fg != back_cell.fg_color {
+                        if let Some(color) = back_cell.fg_color {
+                            queue!(self.stdout, SetForegroundColor(color))?;
+                        } else {
+                            queue!(self.stdout, ResetColor)?;
+                        }
+                        current_fg = back_cell.fg_color;
+                    }
+
+                    if current_bg != back_cell.bg_color {
+                        if let Some(color) = back_cell.bg_color {
+                            queue!(self.stdout, SetBackgroundColor(color))?;
+                        } else {
+                            queue!(self.stdout, ResetColor)?;
+                        }
+                        current_bg = back_cell.bg_color;
+                    }
+
+                    write!(self.stdout, "{}", back_cell.char)?;
+                }
+            }
+        }
+
         self.stdout.flush()?;
+        std::mem::swap(&mut self.front_buffer, &mut self.back_buffer);
         Ok(())
     }
 }
@@ -150,7 +236,7 @@ fn list_devices() -> Result<Vec<cpal::Device>> {
     let host = cpal::default_host();
     let devices = host.input_devices()?;
     println!("Available input devices:\n----------------------");
-    
+
     let device_list: Vec<_> = devices.collect();
     for (idx, device) in device_list.iter().enumerate() {
         if let Ok(name) = device.name() {
@@ -184,29 +270,29 @@ fn main() -> Result<()> {
         println!("No input devices found!");
         return Ok(());
     }
-    
+
     let device_idx = get_user_device_choice(device_list.len());
     let device = &device_list[device_idx];
-    
+
     let config = device.default_input_config()?;
     let sample_rate = config.sample_rate().0;
     println!("\nSelected device: {} @ {} Hz", device.name()?, sample_rate);
     println!("Press Enter to start visualization...");
     let mut input = String::new();
     stdin().read_line(&mut input)?;
-    
+
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(FFT_SIZE);
-    
+
     let (_, term_height) = size()?;
     let history_size = (term_height - 15) as usize;
-    
+
     let mut state = ViewState::new(history_size);
     let buffer = Arc::new(Mutex::new(AudioBuffer {
         samples: vec![0.0; FFT_SIZE],
         position: 0,
     }));
-    
+
     let buffer_clone = Arc::clone(&buffer);
     let stream = device.build_input_stream(
         &config.into(),
@@ -215,13 +301,13 @@ fn main() -> Result<()> {
             for &sample in data {
                 let pos = buffer.position;
                 buffer.samples[pos] = sample;
-                buffer.position = (pos + 1) % FFT_SIZE;
+                buffer.position = (buffer.position + 1) % FFT_SIZE;
             }
         },
         |err| eprintln!("Error in stream: {}", err),
         None,
     )?;
-    
+
     stream.play()?;
     let mut renderer = Renderer::new()?;
 
@@ -246,12 +332,12 @@ fn main() -> Result<()> {
             let buffer = buffer.lock().unwrap();
             let mut ordered_samples = vec![0.0; FFT_SIZE];
             let pos = buffer.position;
-            
+
             for i in 0..FFT_SIZE {
                 let sample_pos = (pos + FFT_SIZE - i) % FFT_SIZE;
                 ordered_samples[FFT_SIZE - 1 - i] = buffer.samples[sample_pos];
             }
-            
+
             let mut fft_buffer: Vec<Complex<f32>> = ordered_samples.iter()
                 .enumerate()
                 .map(|(i, &sample)| {
@@ -259,9 +345,9 @@ fn main() -> Result<()> {
                     Complex::new(sample * window * state.gain * BASE_GAIN, 0.0)
                 })
                 .collect();
-            
+
             fft.process(&mut fft_buffer);
-            
+
             fft_buffer.iter()
                 .take(FFT_SIZE/2)
                 .enumerate()
@@ -272,7 +358,7 @@ fn main() -> Result<()> {
                 })
                 .collect()
         };
-        
+
         state.add_spectrum(spectrum, sample_rate);
         renderer.render(&state, sample_rate)?;
 
@@ -281,6 +367,6 @@ fn main() -> Result<()> {
             thread::sleep(frame_time - elapsed);
         }
     }
-    
+
     Ok(())
 }
