@@ -1,5 +1,5 @@
 [package]
-name = "audio-capture"
+name = "qmx-capture"
 version = "0.1.0"
 edition = "2021"
 
@@ -8,3 +8,4 @@ cpal = "0.15"
 anyhow = "1.0"
 rustfft = "6.1"
 crossterm = "0.27"
+textplots = "0.8"
